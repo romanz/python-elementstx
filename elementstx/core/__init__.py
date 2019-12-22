@@ -2007,6 +2007,135 @@ def derive_blinding_key(blinding_derivation_key: CKeyBase,
                          hashlib.sha256).digest())
 
 
+def blinded_generator(asset: CAsset, blind: Uint256) -> bytes:
+    result = ctypes.create_string_buffer(64)
+    assert 1 == _secp256k1.secp256k1_generator_generate_blinded(
+        secp256k1_blind_context, result, asset.data, blind.data)
+    return bytes(result)
+
+def unblind_confidential_output(
+    nonce: bytes,
+    confValue: CConfidentialValue,
+    confAsset: CConfidentialAsset,
+    committedScript: CElementsScript,
+    rangeproof: Union[bytes, bytearray]) -> 'BlindingOrUnblindingResult':
+    """Unblinds a pair of confidential value and confidential asset
+    given key, nonce, committed script, and rangeproof.
+    returns a tuple of (success, result)
+    If success is True, result is BlindingInputDescriptor namedtuple.
+    If success is False, result is a string describing the cause of failure"""
+    ensure_isinstance(nonce, bytes, 'nonce')
+    ensure_isinstance(confValue, CConfidentialValue, 'confValue')
+    ensure_isinstance(confAsset, CConfidentialAsset, 'confAsset')
+    ensure_isinstance(committedScript, CElementsScript, 'committedScript')
+    ensure_isinstance(rangeproof, (bytes, bytearray), 'rangeproof')
+
+    if len(rangeproof) == 0:
+        return UnblindingFailure('rangeproof is empty')
+
+    # 32 bytes of asset type, 32 bytes of asset blinding factor in sidechannel
+    msg_size = ctypes.c_size_t(64)
+    # API-prescribed sidechannel maximum size,
+    # though we only use 64 bytes
+    msg = ctypes.create_string_buffer(4096)
+
+    # If value is unblinded, we don't support unblinding just the asset
+    if not confValue.is_commitment():
+        return UnblindingFailure('value is not a commitment')
+
+    observed_gen = ctypes.create_string_buffer(64)
+    # Valid asset commitment?
+    if confAsset.is_commitment():
+        res = _secp256k1.secp256k1_generator_parse(
+            secp256k1_blind_context, observed_gen, confAsset.commitment)
+        if res != 1:
+            assert res == 0
+            return UnblindingFailure(
+                'cannot parse asset commitment as a generator')
+    elif confAsset.is_explicit():
+        res = _secp256k1.secp256k1_generator_generate(
+            secp256k1_blind_context, observed_gen, confAsset.to_asset().data)
+        if res != 1:
+            assert res == 0
+            return UnblindingFailure(
+                'unable to create a generator out of asset explicit data')
+
+    commit = ctypes.create_string_buffer(64)
+    # Valid value commitment ?
+    res = _secp256k1.secp256k1_pedersen_commitment_parse(secp256k1_blind_context,
+                                                         commit, confValue.commitment)
+    if res != 1:
+        assert res == 0
+        return UnblindingFailure(
+            'cannot parse value commitment as Pedersen commitment')
+
+    blinding_factor_out = ctypes.create_string_buffer(32)
+
+    min_value = ctypes.c_uint64()
+    max_value = ctypes.c_uint64()
+    amount = ctypes.c_uint64()
+
+    res = _secp256k1.secp256k1_rangeproof_rewind(
+        secp256k1_blind_context,
+        blinding_factor_out,
+        ctypes.byref(amount),
+        msg, ctypes.byref(msg_size),
+        nonce,
+        ctypes.byref(min_value), ctypes.byref(max_value),
+        commit, rangeproof, len(rangeproof),
+        committedScript or None, len(committedScript),
+        observed_gen)
+
+    if 0 == res:
+        return UnblindingFailure('unable to rewind rangeproof')
+
+    assert res == 1
+
+    if not MoneyRange(amount.value):
+        return UnblindingFailure(
+            'resulting amount after rangeproof rewind is outside MoneyRange')
+
+    if msg_size.value != 64:
+        return UnblindingFailure(
+            'resulting message after rangeproof rewind is not 64 bytes in size')
+
+    asset_type = msg.raw[:32]
+    asset_blinder = msg.raw[32:64]
+    recalculated_gen = ctypes.create_string_buffer(64)
+    res = _secp256k1.secp256k1_generator_generate_blinded(
+        secp256k1_blind_context, recalculated_gen, asset_type, asset_blinder)
+    if res != 1:
+        assert res == 0
+        return UnblindingFailure(
+            'unable to recalculate a generator from asset type and asset blinder '
+            'resulted from rangeproof rewind')
+
+    # Serialize both generators then compare
+
+    observed_generator = ctypes.create_string_buffer(33)
+    derived_generator = ctypes.create_string_buffer(33)
+    res = _secp256k1.secp256k1_generator_serialize(
+        secp256k1_blind_context, observed_generator, observed_gen)
+    if 1 != res:
+        assert(res == 0)
+        raise RuntimeError('secp256k1_generator_serialize returned failure')
+
+    res = _secp256k1.secp256k1_generator_serialize(
+        secp256k1_blind_context, derived_generator, recalculated_gen)
+    if 1 != res:
+        assert(res == 0)
+        raise RuntimeError('secp256k1_generator_serialize returned failure')
+
+    if observed_generator.raw != derived_generator.raw:
+        return UnblindingFailure(
+            'generator recalculated after rangeproof rewind '
+            'does not match generator presented in asset commitment')
+
+    return UnblindingSuccess(
+        amount=amount.value, blinding_factor=Uint256(blinding_factor_out.raw),
+        asset=CAsset(asset_type), asset_blinding_factor=Uint256(asset_blinder))
+
+
 __all__ = (
     'CAsset',
     'CAssetIssuance',
