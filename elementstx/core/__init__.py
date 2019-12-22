@@ -1697,7 +1697,9 @@ def create_value_commitment(blind: bytes, gen: bytes, amount: int
 def generate_rangeproof(in_blinds: List[Uint256], nonce: Uint256,
                         amount: int,
                         scriptPubKey: CElementsScript,
-                        commit: bytes, gen: bytes, asset: CAsset,
+                        commit: Union[bytes, CConfidentialValue],
+                        gen: Union[bytes, CConfidentialAsset],
+                        asset: CAsset,
                         in_assetblinds: List[Uint256]) -> bytes:
     # NOTE: This is better done with typing module,
     # available since python3.5. but that means we will have
@@ -1706,10 +1708,24 @@ def generate_rangeproof(in_blinds: List[Uint256], nonce: Uint256,
     ensure_isinstance(nonce, Uint256, 'nonce')
     ensure_isinstance(amount, int, 'amount')
     ensure_isinstance(scriptPubKey, CElementsScript, 'scriptPubKey')
+
+    if isinstance(commit, CConfidentialValue):
+        assert commit.is_commitment()
+        parsed = ctypes.create_string_buffer(64)
+        assert 1 == _secp256k1.secp256k1_pedersen_commitment_parse(secp256k1_blind_context, parsed, commit.commitment)
+        commit = bytes(parsed)
+
     ensure_isinstance(commit, (bytes, bytearray), 'commit')
     if len(commit) != SECP256K1_PEDERSEN_COMMITMENT_SIZE:
         raise ValueError('len(commit) != SECP256K1_PEDERSEN_COMMITMENT_SIZE')
     ensure_isinstance(asset, CAsset, 'asset')
+
+    if isinstance(gen, CConfidentialAsset):
+        assert gen.is_commitment()
+        parsed = ctypes.create_string_buffer(64)
+        assert 1 == _secp256k1.secp256k1_generator_parse(secp256k1_blind_context, parsed, gen.commitment)
+        gen = bytes(parsed)
+
     ensure_isinstance(gen, (bytes, bytearray), 'generator')
     if len(gen) != SECP256K1_GENERATOR_SIZE:
         raise ValueError('len(gen) != SECP256K1_GENERATOR_SIZE')
